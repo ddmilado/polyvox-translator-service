@@ -1,11 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from crewai import Agent, Task, Crew
-from langchain_openai import ChatOpenAI
+from crewai import Agent, Task, Crew, Process
+from openai import OpenAI
 
 app = Flask(__name__)
 CORS(app)
+
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "message": "Translation service is running"})
 
 @app.route('/translate', methods=['POST'])
 def translate():
@@ -21,25 +25,25 @@ def translate():
     os.environ['OPENAI_API_KEY'] = openai_api_key
     
     # Initialize OpenAI client
-    openai = ChatOpenAI(model="gpt-4")
+    openai_client = OpenAI(api_key=openai_api_key)
     
     # Define translation agents
     translator = Agent(
-        name='Translator',
+        role='Translator',
         goal='Translate documents with perfect accuracy while maintaining context and meaning',
         backstory='You are an expert translator with deep knowledge of multiple languages and cultural nuances.',
         verbose=True,
         allow_delegation=False,
-        llm=openai
+        llm=openai_client
     )
     
     editor = Agent(
-        name='Editor',
+        role='Editor',
         goal='Review and refine translations to ensure they are natural and idiomatic',
         backstory='You are a professional editor with years of experience in refining translations.',
         verbose=True,
         allow_delegation=False,
-        llm=openai
+        llm=openai_client
     )
     
     # Define translation task
@@ -62,16 +66,23 @@ def translate():
     translation_crew = Crew(
         agents=[translator, editor],
         tasks=[translate_task, edit_task],
-        verbose=True
+        verbose=True,
+        process=Process.sequential
     )
     
-    # Execute the translation crew
-    result = translation_crew.run()
-    
-    return jsonify({
-        'success': True,
-        'translation': result
-    })
+    try:
+        # Execute the translation crew
+        result = translation_crew.kickoff()
+        
+        return jsonify({
+            'success': True,
+            'translation': result
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
