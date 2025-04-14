@@ -1,8 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from crewai import Agent, Task, Crew, Process
-from openai import OpenAI
+from crewai import Agent, Task, Crew, Process, LLM
 
 app = Flask(__name__)
 CORS(app)
@@ -24,8 +23,8 @@ def translate():
     # Set OpenAI API key
     os.environ['OPENAI_API_KEY'] = openai_api_key
     
-    # Initialize OpenAI client
-    openai_client = OpenAI(api_key=openai_api_key)
+    # Initialize LLM
+    llm = LLM(model="gpt-4")  # or whichever model you're using
     
     # Define translation agents
     translator = Agent(
@@ -34,7 +33,7 @@ def translate():
         backstory='You are an expert translator with deep knowledge of multiple languages and cultural nuances.',
         verbose=True,
         allow_delegation=False,
-        llm=openai_client
+        llm=llm
     )
     
     editor = Agent(
@@ -43,7 +42,7 @@ def translate():
         backstory='You are a professional editor with years of experience in refining translations.',
         verbose=True,
         allow_delegation=False,
-        llm=openai_client
+        llm=llm
     )
     
     # Define translation task
