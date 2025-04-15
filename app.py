@@ -3,68 +3,72 @@ from flask_cors import CORS
 import os
 from crewai import Agent, Task, Crew, Process, LLM
 import logging
-import math
+import tiktoken
 
+# Initialize Flask app and enable CORS
 app = Flask(__name__)
 CORS(app)
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Approximate token estimation (rough, as exact tokenization depends on the model)
-def estimate_tokens(text):
-    """Estimate the number of tokens in a text string (approx. 4 chars per token)."""
-    return len(text) // 4 + len(text.split())  # Accounts for words and punctuation
+# Function to estimate token count using tiktoken
+def estimate_tokens(text, model="gpt-4o-search-preview"):
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
 
-def split_text(text, max_tokens=12000):
-    """Split text into chunks that fit within max_tokens (leaving room for prompts)."""
-    words = text.split()
+# Function to split text into chunks based on token limit
+def split_text(text, max_tokens=10000, model="gpt-3.5-turbo"):
+    encoding = tiktoken.encoding_for_model(model)
+    tokens = encoding.encode(text)
     chunks = []
-    current_chunk = []
-    current_tokens = 0
-    for word in words:
-        word_tokens = estimate_tokens(word)
-        if current_tokens + word_tokens > max_tokens:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_tokens = word_tokens
-        else:
-            current_chunk.append(word)
-            current_tokens += word_tokens
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+    for i in range(0, len(tokens), max_tokens):
+        chunk_tokens = tokens[i:i + max_tokens]
+        chunk_text = encoding.decode(chunk_tokens)
+        chunks.append(chunk_text)
     return chunks
 
+# Health check endpoint
 @app.route('/', methods=['GET'])
 def health_check():
     return jsonify({"status": "healthy", "message": "Translation service is running"})
 
+# Translation endpoint
 @app.route('/translate', methods=['POST'])
 def translate():
     try:
+        # Parse request data
         data = request.json
-        if not all([data.get('sourceText'), data.get('sourceLanguage'), data.get('targetLanguage'), data.get('openaiApiKey')]):
+        required_fields = ['sourceText', 'sourceLanguage', 'targetLanguage', 'openaiApiKey']
+        if not all(data.get(field) for field in required_fields):
             logger.error("Missing required fields in request")
             return jsonify({'success': False, 'error': 'Missing required fields'}), 400
         
+        # Extract data from request
         source_text = data.get('sourceText')
         source_language = data.get('sourceLanguage')
         target_language = data.get('targetLanguage')
         openai_api_key = data.get('openaiApiKey')
         
-        # Estimate tokens and reject if too large overall
+        # Estimate total tokens and log
         total_tokens = estimate_tokens(source_text)
-        if total_tokens > 100000:  # Arbitrary large limit to prevent abuse
+        logger.info(f"Total estimated tokens: {total_tokens}")
+        
+        # Prevent processing of excessively large inputs
+        if total_tokens > 100000:
             logger.error(f"Input too large: {total_tokens} tokens")
             return jsonify({'success': False, 'error': 'Text too large for processing'}), 400
         
+        # Set OpenAI API key and initialize LLM
         os.environ['OPENAI_API_KEY'] = openai_api_key
-        llm = LLM(model="gpt-3.5-turbo")  # Lighter model
+        llm = LLM(model="gpt-3.5-turbo")
         
-        # Define translation agent
+        # Define translator agent
         translator = Agent(
             role='Translator',
-            goal='Translate text accurately while preserving meaning',
-            backstory='Expert translator with knowledge of languages and nuances.',
+            goal='Translate text accurately',
+            backstory='Expert translator',
             verbose=True,
             allow_delegation=False,
             llm=llm
@@ -73,60 +77,38 @@ def translate():
         # Define editor agent
         editor = Agent(
             role='Editor',
-            goal='Refine translations to sound natural',
-            backstory='Experienced editor for polished translations.',
+            goal='Refine translations',
+            backstory='Experienced editor',
             verbose=True,
             allow_delegation=False,
             llm=llm
         )
         
-        # Check if chunking is needed
-        if total_tokens > 12000:  # Leave room for prompts (~4000 tokens)
-            logger.info(f"Chunking text: {total_tokens} tokens")
-            chunks = split_text(source_text, max_tokens=12000)
-            final_translation = []
-            for i, chunk in enumerate(chunks):
-                logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-                
-                # Define tasks for each chunk
-                translate_task = Task(
-                    description=f"Translate this text from {source_language} to {target_language}: {chunk}",
-                    agent=translator,
-                    expected_output='Translated text preserving meaning'
-                )
-                
-                edit_task = Task(
-                    description=f"Refine the translated text to sound natural in {target_language}.",
-                    agent=editor,
-                    expected_output='Polished translation'
-                )
-                
-                # Create crew for chunk
-                translation_crew = Crew(
-                    agents=[translator, editor],
-                    tasks=[translate_task, edit_task],
-                    verbose=True,
-                    process=Process.sequential
-                )
-                
-                chunk_result = translation_crew.kickoff()
-                final_translation.append(chunk_result)
+        # Split text into manageable chunks
+        chunks = split_text(source_text, max_tokens=10000)
+        logger.info(f"Number of chunks: {len(chunks)}")
+        
+        # Process each chunk and collect results
+        final_translation = []
+        for i, chunk in enumerate(chunks):
+            chunk_tokens = estimate_tokens(chunk)
+            logger.info(f"Processing chunk {i+1}/{len(chunks)} with {chunk_tokens} tokens")
             
-            result = " ".join(final_translation)
-        else:
-            # Process as single task if small enough
+            # Define translation task
             translate_task = Task(
-                description=f"Translate this text from {source_language} to {target_language}: {source_text}",
+                description=f"Translate from {source_language} to {target_language}: {chunk}",
                 agent=translator,
-                expected_output='Translated text preserving meaning'
+                expected_output='Translated text'
             )
             
+            # Define editing task
             edit_task = Task(
-                description=f"Refine the translated text to sound natural in {target_language}.",
+                description=f"Refine translation for {target_language}.",
                 agent=editor,
                 expected_output='Polished translation'
             )
             
+            # Create and run crew for this chunk
             translation_crew = Crew(
                 agents=[translator, editor],
                 tasks=[translate_task, edit_task],
@@ -134,15 +116,21 @@ def translate():
                 process=Process.sequential
             )
             
-            logger.info("Starting translation crew")
-            result = translation_crew.kickoff()
+            chunk_result = translation_crew.kickoff()
+            final_translation.append(chunk_result)
         
+        # Combine chunk results into final translation
+        result = " ".join(final_translation)
         logger.info("Translation and editing completed successfully")
+        
+        # Return successful response
         return jsonify({
             'success': True,
             'translation': result
         })
+    
     except Exception as e:
+        # Log the error and handle specific cases
         logger.exception("Translation failed")
         if "context_length_exceeded" in str(e):
             return jsonify({
@@ -154,6 +142,7 @@ def translate():
             'error': str(e)
         }), 500
 
+# Run the Flask app
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
