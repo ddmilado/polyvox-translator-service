@@ -24,7 +24,7 @@ def translate():
     os.environ['OPENAI_API_KEY'] = openai_api_key
     
     # Initialize LLM
-    llm = LLM(model="gpt-4.1-mini")  # or whichever model you're using
+    llm = LLM(model="gpt-4-turbo-preview")  # or whichever model you're using
     
     # Define translation agents
     translator = Agent(
