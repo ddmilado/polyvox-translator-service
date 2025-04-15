@@ -23,7 +23,7 @@ MAX_TOTAL_TOKENS = 100000
 TOKEN_COST_PER_1K = 0.01  # Cost per 1K tokens for GPT-4-turbo-preview
 
 # Function to estimate token count using tiktoken
-def estimate_tokens(text, model="gpt-4-turbo-preview"):
+def estimate_tokens(text, model="gpt-3.5-turbo"):
     encoding = tiktoken.encoding_for_model(model)
     return len(encoding.encode(text))
 
@@ -32,7 +32,7 @@ def estimate_cost(total_tokens):
     return (total_tokens / 1000) * TOKEN_COST_PER_1K
 
 # Function to split text into chunks based on token limit
-def split_text(text, max_tokens=MAX_TOKENS_PER_CHUNK, model="gpt-4-turbo-preview"):
+def split_text(text, max_tokens=MAX_TOKENS_PER_CHUNK, model="gpt-3.5-turbo"):
     encoding = tiktoken.encoding_for_model(model)
     tokens = encoding.encode(text)
     
@@ -97,7 +97,7 @@ def translate():
         
         # Set OpenAI API key and initialize LLM
         os.environ['OPENAI_API_KEY'] = openai_api_key
-        llm = LLM(model="gpt-4-turbo-preview")
+        llm = LLM(model="gpt-3.5-turbo")
         
         # Define translator agent
         translator = Agent(
