@@ -14,12 +14,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Function to estimate token count using tiktoken
-def estimate_tokens(text, model="gpt-4o-search-preview"):
+def estimate_tokens(text, model="gpt-3.5-turbo"):
     encoding = tiktoken.encoding_for_model(model)
     return len(encoding.encode(text))
 
 # Function to split text into chunks based on token limit
-def split_text(text, max_tokens=10000, model="gpt-4o-search-preview"):
+def split_text(text, max_tokens=10000, model="gpt-3.5-turbo"):
     encoding = tiktoken.encoding_for_model(model)
     tokens = encoding.encode(text)
     chunks = []
@@ -62,7 +62,7 @@ def translate():
         
         # Set OpenAI API key and initialize LLM
         os.environ['OPENAI_API_KEY'] = openai_api_key
-        llm = LLM(model="gpt-4o-search-preview")
+        llm = LLM(model="gpt-3.5-turbo")
         
         # Define translator agent
         translator = Agent(
