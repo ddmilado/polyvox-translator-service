@@ -27,7 +27,7 @@ def translate():
         openai_api_key = data.get('openaiApiKey')
         
         # Validate input size to prevent overload
-        if len(source_text) > 5000:  # Adjust limit based on testing
+        if len(source_text) > 55000:  # Adjust limit based on testing
             logger.error("Input text too long")
             return jsonify({'success': False, 'error': 'Text exceeds maximum length'}), 400
         
