@@ -19,7 +19,7 @@ def estimate_tokens(text, model="gpt-4o-search-preview"):
     return len(encoding.encode(text))
 
 # Function to split text into chunks based on token limit
-def split_text(text, max_tokens=10000, model="gpt-3.5-turbo"):
+def split_text(text, max_tokens=10000, model="gpt-4o-search-preview"):
     encoding = tiktoken.encoding_for_model(model)
     tokens = encoding.encode(text)
     chunks = []
@@ -62,7 +62,7 @@ def translate():
         
         # Set OpenAI API key and initialize LLM
         os.environ['OPENAI_API_KEY'] = openai_api_key
-        llm = LLM(model="gpt-3.5-turbo")
+        llm = LLM(model="gpt-4o-search-preview")
         
         # Define translator agent
         translator = Agent(
@@ -117,7 +117,16 @@ def translate():
             )
             
             chunk_result = translation_crew.kickoff()
-            final_translation.append(chunk_result)
+            
+            # Extract the translated text from CrewOutput
+            if hasattr(chunk_result, 'raw'):
+                final_translation.append(chunk_result.raw)
+            else:
+                logger.error(f"Unable to extract result from CrewOutput for chunk {i+1}")
+                return jsonify({'success': False, 'error': 'Failed to extract translation result'}), 500
+        
+        # Log the collected translation parts for debugging
+        logger.info(f"Final translation parts: {final_translation}")
         
         # Combine chunk results into final translation
         result = " ".join(final_translation)
@@ -130,7 +139,6 @@ def translate():
         })
     
     except Exception as e:
-        # Log the error and handle specific cases
         logger.exception("Translation failed")
         if "context_length_exceeded" in str(e):
             return jsonify({
