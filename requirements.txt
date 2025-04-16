@@ -6,3 +6,4 @@ tiktoken>=0.7.0
 gunicorn==21.2.0
 psutil==5.9.8
 supabase==2.15.0
+reportlab==4.3.1

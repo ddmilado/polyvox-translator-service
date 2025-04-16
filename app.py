@@ -1,6 +1,5 @@
 import os
 import uuid
-import json
 import time
 import signal
 import sys
@@ -12,6 +11,8 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 # Import Crew AI components.
 # Adjust these import paths as needed for your environment.
@@ -36,8 +37,8 @@ MAX_TOTAL_LENGTH = 100000  # Maximum allowed characters in the source text
 
 # Temporary directories for job files
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "translation_service")
-RESULTS_DIR = os.path.join(TEMP_DIR, "results")
-for directory in [TEMP_DIR, RESULTS_DIR]:
+PDF_DIR = os.path.join(TEMP_DIR, "pdfs")
+for directory in [TEMP_DIR, PDF_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -62,16 +63,37 @@ def chunk_text(text, chunk_size=CHUNK_SIZE):
     """
     return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-def save_result_to_file(job_id, result_data):
+def save_translation_to_pdf(job_id, translation_text):
     """
-    Save the translation result (a dictionary) as a JSON file.
+    Save the translated text into a PDF file.
     """
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    result_path = os.path.join(RESULTS_DIR, f"{job_id}.json")
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result_data, f, ensure_ascii=False, indent=2)
-    logger.info(f"Saved job result to {result_path}")
-    return result_path
+    pdf_path = os.path.join(PDF_DIR, f"{job_id}.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    width, height = letter
+    # Set a margin and a starting y position
+    margin = 40
+    y_position = height - margin
+    text_object = c.beginText(margin, y_position)
+    text_object.setFont("Helvetica", 12)
+    
+    # Split the translation into lines that fit the width.
+    # This is a simple wrap; for more complex documents consider using Platypus.
+    lines = translation_text.split("\n")
+    for line in lines:
+        # further wrap the line if it is too long
+        # here we assume 90 characters per line is a rough fit; adjust as necessary
+        wrapped = [line[i:i+90] for i in range(0, len(line), 90)]
+        for wrap_line in wrapped:
+            text_object.textLine(wrap_line)
+            if text_object.getY() < margin:
+                c.drawText(text_object)
+                c.showPage()
+                text_object = c.beginText(margin, height - margin)
+                text_object.setFont("Helvetica", 12)
+    c.drawText(text_object)
+    c.save()
+    logger.info(f"Saved translation as PDF to {pdf_path}")
+    return pdf_path
 
 def upload_to_supabase(file_path, remote_filename):
     """
@@ -97,19 +119,19 @@ def get_job_data(job_id):
 
 def clean_up_job(job_id):
     """
-    Remove job from memory and schedule deletion of its result file.
+    Remove job from memory and schedule deletion of its PDF file.
     """
     with job_lock:
         if job_id in jobs:
             del jobs[job_id]
-    result_file = os.path.join(RESULTS_DIR, f"{job_id}.json")
-    if os.path.exists(result_file):
+    pdf_file = os.path.join(PDF_DIR, f"{job_id}.pdf")
+    if os.path.exists(pdf_file):
         def delete_file():
             try:
-                os.remove(result_file)
-                logger.info(f"Cleaned up result file for job {job_id}")
+                os.remove(pdf_file)
+                logger.info(f"Cleaned up PDF file for job {job_id}")
             except Exception as e:
-                logger.warning(f"Failed to delete result file for job {job_id}: {e}")
+                logger.warning(f"Failed to delete PDF file for job {job_id}: {e}")
         t = threading.Timer(3600, delete_file)  # Delete after 1 hour
         t.daemon = True
         t.start()
@@ -183,7 +205,7 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language, ap
 def process_translation_job(job_id, source_text, source_language, target_language, api_key):
     """
     Split the source text into chunks, translate each chunk using Crew AI,
-    save the final translation to a JSON file, and upload it to Supabase.
+    create a PDF with the full translation, and upload it to Supabase.
     """
     try:
         update_job_data(job_id, {"status": "processing", "chunks_completed": 0, "total_chunks": 0})
@@ -211,29 +233,15 @@ def process_translation_job(job_id, source_text, source_language, target_languag
                 logger.error(f"Job {job_id}: Error in chunk {idx+1}: {e}")
         
         final_translation = "\n\n".join(translated_chunks)
-        job_result = {
-            "job_id": job_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "completed",
-            "success": True,
-            "translation": final_translation,
-            "metadata": {
-                "total_chunks": len(chunks),
-                "source_language": source_language,
-                "target_language": target_language
-            }
-        }
+        # Create a PDF file with the translated text.
+        pdf_path = save_translation_to_pdf(job_id, final_translation)
+        update_job_data(job_id, {"status": "completed", "result_file": pdf_path})
         
-        # Save job result locally.
-        result_path = save_result_to_file(job_id, job_result)
-        update_job_data(job_id, {"status": "completed", "result_file": result_path})
-        
-        # Upload the result file to Supabase Storage.
+        # Upload the PDF file to Supabase Storage.
         try:
-            upload_to_supabase(result_path, f"{job_id}.json")
+            upload_to_supabase(pdf_path, f"{job_id}.pdf")
         except Exception as upload_error:
             logger.error(f"Job {job_id}: Supabase upload error: {upload_error}")
-            job_result["status"] = "upload_failed"
             update_job_data(job_id, {"status": "upload_failed", "error": str(upload_error)})
         
     except Exception as e:
@@ -314,11 +322,13 @@ def job_status(job_id):
     Return the current status and job data.
     """
     try:
-        result_file = os.path.join(RESULTS_DIR, f"{job_id}.json")
-        if os.path.exists(result_file):
-            with open(result_file, "r", encoding="utf-8") as f:
-                result_data = json.load(f)
-            return jsonify(result_data)
+        pdf_file = os.path.join(PDF_DIR, f"{job_id}.pdf")
+        if os.path.exists(pdf_file):
+            return jsonify({
+                "job_id": job_id,
+                "status": "completed",
+                "result_file": pdf_file
+            })
         job_data = get_job_data(job_id)
         if job_data:
             return jsonify(job_data)
@@ -338,13 +348,13 @@ def cancel_job(job_id):
             return jsonify({"success": False, "error": "Job not found"}), 404
         
         update_job_data(job_id, {"status": "cancelled"})
-        result_data = {
+        cancel_data = {
             "success": False,
             "status": "cancelled",
             "error": "Job cancelled by user",
             "timestamp": datetime.utcnow().isoformat()
         }
-        save_result_to_file(job_id, result_data)
+        save_translation_to_pdf(job_id, cancel_data.get("error"))
         return jsonify({"success": True, "job_id": job_id, "status": "cancelled"})
     
     except Exception as e:
@@ -359,13 +369,13 @@ def cleanup_on_exit(*args, **kwargs):
         for job_id, job_data in jobs.items():
             if job_data.get("status") in ["created", "processing"]:
                 job_data["status"] = "interrupted"
-                result_data = {
+                interruption_data = {
                     "success": False,
                     "status": "interrupted",
                     "error": "Service shutdown before job completion",
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                save_result_to_file(job_id, result_data)
+                save_translation_to_pdf(job_id, interruption_data.get("error"))
     sys.exit(0)
 
 signal.signal(signal.SIGINT, cleanup_on_exit)
@@ -377,12 +387,12 @@ def maintenance_thread():
     while True:
         try:
             now = time.time()
-            for filename in os.listdir(RESULTS_DIR):
-                filepath = os.path.join(RESULTS_DIR, filename)
+            for filename in os.listdir(PDF_DIR):
+                filepath = os.path.join(PDF_DIR, filename)
                 if os.path.isfile(filepath) and now - os.path.getmtime(filepath) > 86400:
                     try:
                         os.remove(filepath)
-                        logger.info(f"Removed old result file: {filename}")
+                        logger.info(f"Removed old PDF file: {filename}")
                     except Exception as e:
                         logger.warning(f"Failed to remove old file {filename}: {e}")
         except Exception as e:
@@ -401,7 +411,7 @@ if __name__ == "__main__":
     try:
         for item in os.listdir(TEMP_DIR):
             item_path = os.path.join(TEMP_DIR, item)
-            if os.path.isdir(item_path) and item != "results":
+            if os.path.isdir(item_path) and item != "pdfs":
                 shutil.rmtree(item_path)
             elif os.path.isfile(item_path):
                 os.remove(item_path)
