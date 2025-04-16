@@ -9,25 +9,34 @@ from datetime import datetime
 import tiktoken
 import logging
 import tempfile
-import signal
 import shutil
 import psutil
+import threading
+import queue
+import signal
+from functools import partial
 
 # Initialize Flask app and enable CORS
 app = Flask(__name__)
 CORS(app)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_CHUNKS = 50
-MAX_TOKENS_PER_CHUNK = 2000  # Drastically reduced chunk size
+MAX_CHUNKS = 100
+MAX_TOKENS_PER_CHUNK = 1000  # Further reduced chunk size
 MAX_TOTAL_TOKENS = 100000
 TOKEN_COST_PER_1K = 0.01
-PROCESS_TIMEOUT = 60  # Maximum seconds to wait for a chunk translation
+PROCESS_TIMEOUT = 120  # Increased timeout (2 minutes)
+MAX_RETRIES = 3  # Allow retrying failed chunks
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "translation_service")
+MAX_CONCURRENT_PROCESSES = 2  # Limit concurrent translation processes
+MEMORY_LIMIT_PERCENT = 75  # Kill process if memory usage exceeds this percentage
 
 # Create temp directory if it doesn't exist
 if not os.path.exists(TEMP_DIR):
@@ -35,156 +44,154 @@ if not os.path.exists(TEMP_DIR):
 
 # Function to estimate token count
 def estimate_tokens(text, model="gpt-3.5-turbo"):
-    encoding = tiktoken.encoding_for_model(model)
-    return len(encoding.encode(text))
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except Exception as e:
+        logger.warning(f"Error estimating tokens: {e}")
+        # Fallback to character-based estimation (rough approximation)
+        return len(text) // 4
 
 # Function to estimate translation cost
 def estimate_cost(total_tokens):
     return (total_tokens / 1000) * TOKEN_COST_PER_1K
 
-# Function to split text into very small chunks
+# Function to split text into smaller chunks with improved handling
 def split_text(text, max_tokens=MAX_TOKENS_PER_CHUNK, model="gpt-3.5-turbo"):
-    encoding = tiktoken.encoding_for_model(model)
-    tokens = encoding.encode(text)
-    
-    if len(tokens) <= max_tokens:
-        return [text]
-    
-    # Split text at sentence boundaries when possible
-    sentences = []
-    for paragraph in text.split('\n'):
-        for sentence in paragraph.replace('. ', '.\n').replace('! ', '!\n').replace('? ', '?\n').split('\n'):
-            if sentence.strip():
-                sentences.append(sentence.strip())
-    
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    
-    for sentence in sentences:
-        sentence_tokens = len(encoding.encode(sentence))
-        
-        # Handle very long sentences by splitting them directly
-        if sentence_tokens > max_tokens:
-            # If we have content in the current chunk, add it first
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-                current_chunk = []
-                current_length = 0
-            
-            # Split the long sentence by tokens
-            sentence_encoding = encoding.encode(sentence)
-            for i in range(0, len(sentence_encoding), max_tokens // 2):
-                sub_chunk_tokens = sentence_encoding[i:i + (max_tokens // 2)]
-                sub_chunk_text = encoding.decode(sub_chunk_tokens)
-                chunks.append(sub_chunk_text)
-        
-        # Check if adding this sentence would exceed the limit
-        elif current_length + sentence_tokens > max_tokens:
-            # Save current chunk and start a new one with this sentence
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [sentence]
-            current_length = sentence_tokens
-        else:
-            # Add sentence to current chunk
-            current_chunk.append(sentence)
-            current_length += sentence_tokens
-    
-    # Add the last chunk if it exists
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    # Ensure no chunk exceeds the token limit
-    final_chunks = []
-    for chunk in chunks:
-        chunk_tokens = len(encoding.encode(chunk))
-        if chunk_tokens > max_tokens:
-            # This shouldn't happen given our chunking approach, but just in case
-            chunk_encoding = encoding.encode(chunk)
-            for i in range(0, len(chunk_encoding), max_tokens // 2):
-                sub_chunk_tokens = chunk_encoding[i:i + (max_tokens // 2)]
-                sub_chunk_text = encoding.decode(sub_chunk_tokens)
-                final_chunks.append(sub_chunk_text)
-        else:
-            final_chunks.append(chunk)
-    
-    # Check if we have too many chunks
-    if len(final_chunks) > MAX_CHUNKS:
-        logger.warning(f"Text split into {len(final_chunks)} chunks, limiting to {MAX_CHUNKS}")
-        final_chunks = final_chunks[:MAX_CHUNKS]
-    
-    return final_chunks
-
-# Separate process function for translation to isolate memory usage
-def translate_chunk(chunk_id, chunk_text, source_language, target_language, api_key):
-    """This runs in a completely separate Python process"""
-    import os
-    import json
-    from crewai import Agent, Task, Crew, Process, LLM
-    
-    # Set the API key
-    os.environ['OPENAI_API_KEY'] = api_key
-    
     try:
-        # Initialize LLM with timeout
-        llm = LLM(model="gpt-3.5-turbo", timeout=120)
+        encoding = tiktoken.encoding_for_model(model)
+        tokens = encoding.encode(text)
         
-        # Create agents
-        translator = Agent(
-            role='Translator',
-            goal=f'Translate text from {source_language} to {target_language}',
-            backstory='Expert translator',
-            verbose=True,
-            allow_delegation=False,
-            llm=llm
-        )
+        if len(tokens) <= max_tokens:
+            return [text]
+            
+        # Enhanced text splitting strategy
+        chunks = []
         
-        editor = Agent(
-            role='Editor',
-            goal=f'Refine {target_language} translation',
-            backstory='Experienced editor',
-            verbose=True,
-            allow_delegation=False,
-            llm=llm
-        )
+        # First try to split by paragraphs
+        paragraphs = text.split('\n')
+        current_chunk = []
+        current_length = 0
         
-        # Define tasks
-        translate_task = Task(
-            description=f"Translate from {source_language} to {target_language}: {chunk_text}",
-            agent=translator,
-            expected_output='Translated text'
-        )
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+                
+            paragraph_tokens = len(encoding.encode(paragraph))
+            
+            # If a single paragraph exceeds max tokens, split it by sentences
+            if paragraph_tokens > max_tokens:
+                # Add the current chunk if not empty
+                if current_chunk:
+                    chunks.append('\n'.join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+                
+                # Split the paragraph into sentences
+                sentences = []
+                for sent in paragraph.replace('. ', '.\n').replace('! ', '!\n').replace('? ', '?\n').split('\n'):
+                    if sent.strip():
+                        sentences.append(sent.strip())
+                
+                # Process sentences
+                sentence_chunk = []
+                sentence_length = 0
+                
+                for sentence in sentences:
+                    sentence_tokens = len(encoding.encode(sentence))
+                    
+                    # If a single sentence exceeds max tokens, split it directly
+                    if sentence_tokens > max_tokens:
+                        # Add current sentence chunk if not empty
+                        if sentence_chunk:
+                            chunks.append(' '.join(sentence_chunk))
+                            sentence_chunk = []
+                            sentence_length = 0
+                        
+                        # Split the sentence by tokens
+                        sentence_tokens_list = encoding.encode(sentence)
+                        for i in range(0, len(sentence_tokens_list), max_tokens // 2):
+                            sub_tokens = sentence_tokens_list[i:i + (max_tokens // 2)]
+                            sub_text = encoding.decode(sub_tokens)
+                            chunks.append(sub_text)
+                    
+                    # Check if adding this sentence would exceed the limit
+                    elif sentence_length + sentence_tokens > max_tokens:
+                        chunks.append(' '.join(sentence_chunk))
+                        sentence_chunk = [sentence]
+                        sentence_length = sentence_tokens
+                    else:
+                        sentence_chunk.append(sentence)
+                        sentence_length += sentence_tokens
+                
+                # Add the last sentence chunk if it exists
+                if sentence_chunk:
+                    chunks.append(' '.join(sentence_chunk))
+            
+            # Check if adding this paragraph would exceed the limit
+            elif current_length + paragraph_tokens > max_tokens:
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = [paragraph]
+                current_length = paragraph_tokens
+            else:
+                current_chunk.append(paragraph)
+                current_length += paragraph_tokens
         
-        edit_task = Task(
-            description=f"Refine translation for {target_language}.",
-            agent=editor,
-            expected_output='Polished translation'
-        )
+        # Add the last chunk if it exists
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
         
-        # Create and run crew
-        translation_crew = Crew(
-            agents=[translator, editor],
-            tasks=[translate_task, edit_task],
-            verbose=True,
-            process=Process.sequential
-        )
+        # Verify that no chunk exceeds the token limit
+        final_chunks = []
+        for chunk in chunks:
+            chunk_tokens = len(encoding.encode(chunk))
+            if chunk_tokens > max_tokens:
+                # This shouldn't happen with our approach, but just in case
+                chunk_tokens_list = encoding.encode(chunk)
+                for i in range(0, len(chunk_tokens_list), max_tokens // 2):
+                    sub_tokens = chunk_tokens_list[i:i + (max_tokens // 2)]
+                    sub_text = encoding.decode(sub_tokens)
+                    final_chunks.append(sub_text)
+            else:
+                final_chunks.append(chunk)
         
-        result = translation_crew.kickoff()
-        return {"success": True, "translation": result.raw if hasattr(result, 'raw') else str(result)}
-    
+        # Check if we have too many chunks
+        if len(final_chunks) > MAX_CHUNKS:
+            logger.warning(f"Text split into {len(final_chunks)} chunks, limiting to {MAX_CHUNKS}")
+            final_chunks = final_chunks[:MAX_CHUNKS]
+        
+        return final_chunks
+        
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.error(f"Error splitting text: {e}")
+        # Fallback to a simpler approach
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        
+        for word in words:
+            if len(' '.join(current_chunk + [word])) > max_tokens * 3:  # Rough character estimation
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+            else:
+                current_chunk.append(word)
+                
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+            
+        return chunks
 
-# Write chunk translator script to a file
-def write_chunk_translator_script():
-    script_path = os.path.join(TEMP_DIR, "chunk_translator.py")
+# Write simpler translator script that uses only one agent
+def write_simplified_translator_script():
+    script_path = os.path.join(TEMP_DIR, "simplified_translator.py")
     with open(script_path, 'w') as f:
         f.write("""
 import sys
 import json
 import os
-from crewai import Agent, Task, Crew, Process, LLM
 import traceback
+from openai import OpenAI
 
 # Get arguments
 chunk_text = sys.argv[1]
@@ -193,61 +200,30 @@ target_language = sys.argv[3]
 api_key = sys.argv[4]
 output_file = sys.argv[5]
 
-# Set the API key
-os.environ['OPENAI_API_KEY'] = api_key
-
 try:
-    # Initialize LLM with timeout
-    llm = LLM(model="gpt-3.5-turbo", timeout=120)
+    # Set up OpenAI client
+    client = OpenAI(api_key=api_key)
     
-    # Create agents
-    translator = Agent(
-        role='Translator',
-        goal=f'Translate text from {source_language} to {target_language}',
-        backstory='Expert translator',
-        verbose=True,
-        allow_delegation=False,
-        llm=llm
+    # Create system message
+    system_message = f"You are a professional translator. Translate the following text from {source_language} to {target_language}. Keep the meaning, tone, and style intact."
+    
+    # Make API call
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": chunk_text}
+        ],
+        temperature=0.3,
+        max_tokens=2048
     )
     
-    editor = Agent(
-        role='Editor',
-        goal=f'Refine {target_language} translation',
-        backstory='Experienced editor',
-        verbose=True,
-        allow_delegation=False,
-        llm=llm
-    )
-    
-    # Define tasks
-    translate_task = Task(
-        description=f"Translate from {source_language} to {target_language}: {chunk_text}",
-        agent=translator,
-        expected_output='Translated text'
-    )
-    
-    edit_task = Task(
-        description=f"Refine translation for {target_language}.",
-        agent=editor,
-        expected_output='Polished translation'
-    )
-    
-    # Create and run crew
-    translation_crew = Crew(
-        agents=[translator, editor],
-        tasks=[translate_task, edit_task],
-        verbose=True,
-        process=Process.sequential
-    )
-    
-    result = translation_crew.kickoff()
+    # Get translation
+    translation = response.choices[0].message.content
     
     # Write result to output file
     with open(output_file, 'w') as f:
-        if hasattr(result, 'raw'):
-            f.write(result.raw)
-        else:
-            f.write(str(result))
+        f.write(translation)
     
     # Success exit code
     sys.exit(0)
@@ -261,53 +237,126 @@ except Exception as e:
 """)
     return script_path
 
+# Process management class
+class TranslationProcessor:
+    def __init__(self):
+        self.process_semaphore = threading.Semaphore(MAX_CONCURRENT_PROCESSES)
+        self.active_processes = {}
+        self.process_lock = threading.Lock()
+    
+    def run_subprocess_safe(self, cmd, timeout=PROCESS_TIMEOUT):
+        """Run subprocess with timeout and memory monitoring"""
+        with self.process_semaphore:
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+                
+                # Register process
+                with self.process_lock:
+                    self.active_processes[process.pid] = process
+                
+                # Start memory monitoring
+                stop_monitoring = threading.Event()
+                monitor_thread = threading.Thread(
+                    target=self._monitor_process_memory,
+                    args=(process.pid, stop_monitoring)
+                )
+                monitor_thread.daemon = True
+                monitor_thread.start()
+                
+                try:
+                    # Wait for process with timeout
+                    stdout, stderr = process.communicate(timeout=timeout)
+                    
+                    # Stop monitoring
+                    stop_monitoring.set()
+                    
+                    # Unregister process
+                    with self.process_lock:
+                        if process.pid in self.active_processes:
+                            del self.active_processes[process.pid]
+                    
+                    return process.returncode, stdout, stderr
+                    
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Process {process.pid} timed out after {timeout}s")
+                    self._kill_process_tree(process.pid)
+                    return -1, "", "Process timed out"
+                    
+            except Exception as e:
+                logger.error(f"Error running subprocess: {e}")
+                return -1, "", str(e)
+    
+    def _monitor_process_memory(self, pid, stop_event):
+        """Monitor process memory usage and kill if it exceeds limits"""
+        try:
+            while not stop_event.is_set():
+                try:
+                    proc = psutil.Process(pid)
+                    mem_info = proc.memory_info()
+                    mem_percent = mem_info.rss / psutil.virtual_memory().total * 100
+                    
+                    if mem_percent > MEMORY_LIMIT_PERCENT:
+                        logger.warning(f"Process {pid} using {mem_percent:.1f}% memory, killing")
+                        self._kill_process_tree(pid)
+                        break
+                except (psutil.NoSuchProcess, ProcessLookupError):
+                    break  # Process ended
+                    
+                # Check every 0.5 seconds
+                time.sleep(0.5)
+                
+        except Exception as e:
+            logger.error(f"Error monitoring process memory: {e}")
+    
+    def _kill_process_tree(self, pid):
+        """Kill a process and all its children"""
+        try:
+            with self.process_lock:
+                if pid in self.active_processes:
+                    parent = psutil.Process(pid)
+                    children = parent.children(recursive=True)
+                    
+                    # Kill children
+                    for child in children:
+                        try:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                            
+                    # Kill parent
+                    try:
+                        parent.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                        
+                    # Remove from active processes
+                    del self.active_processes[pid]
+                    
+        except Exception as e:
+            logger.error(f"Error killing process tree: {e}")
+    
+    def clean_up(self):
+        """Kill all active processes"""
+        with self.process_lock:
+            for pid in list(self.active_processes.keys()):
+                self._kill_process_tree(pid)
+
+# Create processor instance
+translation_processor = TranslationProcessor()
+
 # Health check endpoint
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "message": "Translation service is running"})
-
-# Run subprocess with timeout and memory monitoring
-def run_subprocess_safe(cmd, timeout=PROCESS_TIMEOUT):
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        
-        # Monitor process memory usage
-        def check_process_memory():
-            try:
-                proc = psutil.Process(process.pid)
-                while process.poll() is None:
-                    mem_info = proc.memory_info()
-                    mem_percent = mem_info.rss / psutil.virtual_memory().total * 100
-                    if mem_percent > 85:  # Kill if using more than 85% memory
-                        logger.warning(f"Process {process.pid} using {mem_percent:.1f}% memory, killing")
-                        process.kill()
-                        return
-                    time.sleep(1)
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                pass  # Process already ended
-        
-        # Start memory monitoring in a separate thread
-        import threading
-        monitor_thread = threading.Thread(target=check_process_memory)
-        monitor_thread.daemon = True
-        monitor_thread.start()
-        
-        # Wait for process with timeout
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            return process.returncode, stdout, stderr
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Process {process.pid} timed out after {timeout}s, killing")
-            process.kill()
-            return -1, "", "Process timed out"
-            
-    except Exception as e:
-        return -1, "", str(e)
+    return jsonify({
+        "status": "healthy", 
+        "message": "Translation service is running",
+        "version": "2.0"
+    })
 
 # Translation endpoint
 @app.route('/translate', methods=['POST'])
@@ -334,95 +383,119 @@ def translate():
         # Estimate total tokens and log
         total_tokens = estimate_tokens(source_text)
         estimated_cost = estimate_cost(total_tokens)
-        logger.info(f"Total estimated tokens: {total_tokens}, Estimated cost: ${estimated_cost:.4f}")
+        logger.info(f"Session {session_id}: Total estimated tokens: {total_tokens}, Estimated cost: ${estimated_cost:.4f}")
         
         # Prevent processing of excessively large inputs
         if total_tokens > MAX_TOTAL_TOKENS:
-            logger.error(f"Input too large: {total_tokens} tokens")
+            logger.error(f"Session {session_id}: Input too large: {total_tokens} tokens")
             return jsonify({
                 'success': False, 
                 'error': f'Text too large for processing. Maximum allowed tokens: {MAX_TOTAL_TOKENS}',
                 'estimated_cost': f"${estimated_cost:.4f}"
             }), 400
         
-        # Split text into very small chunks
+        # Split text into smaller chunks
         try:
             chunks = split_text(source_text, max_tokens=MAX_TOKENS_PER_CHUNK)
-        except ValueError as e:
-            return jsonify({'success': False, 'error': str(e)}), 400
+        except Exception as e:
+            logger.error(f"Session {session_id}: Error splitting text: {e}")
+            return jsonify({'success': False, 'error': f"Error splitting text: {str(e)}"}), 400
             
-        logger.info(f"Number of chunks: {len(chunks)}")
+        logger.info(f"Session {session_id}: Number of chunks: {len(chunks)}")
         
-        # Create script file for translation subprocess
-        script_path = write_chunk_translator_script()
+        # Create simplified script file for translation subprocess
+        script_path = write_simplified_translator_script()
         
-        # Process each chunk with a separate process
-        results = []
+        # Process each chunk with pool of workers
+        results = [None] * len(chunks)  # Pre-allocate results array
         failed_chunks = []
         
         start_time = time.time()
         
+        # Process chunks with retries
         for i, chunk in enumerate(chunks):
-            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+            logger.info(f"Session {session_id}: Processing chunk {i+1}/{len(chunks)}")
             
-            # Save chunk to temporary file
-            chunk_file = os.path.join(session_dir, f"chunk_{i}.txt")
-            with open(chunk_file, 'w') as f:
-                f.write(chunk)
+            # Retry logic
+            success = False
+            retry_count = 0
             
-            # Output file for translation result
-            output_file = os.path.join(session_dir, f"result_{i}.txt")
-            
-            # Create command for separate process
-            cmd = [
-                "python3", script_path,
-                chunk, source_language, target_language, 
-                openai_api_key, output_file
-            ]
-            
-            # Run translation in separate process with timeout
-            logger.info(f"Starting subprocess for chunk {i+1}")
-            returncode, stdout, stderr = run_subprocess_safe(cmd, timeout=PROCESS_TIMEOUT)
-            
-            # Check if translation succeeded
-            if returncode == 0 and os.path.exists(output_file):
-                with open(output_file, 'r') as f:
-                    result = f.read()
-                    
-                if result.startswith("ERROR:"):
-                    logger.error(f"Chunk {i+1} failed: {result}")
-                    failed_chunks.append(i)
+            while not success and retry_count < MAX_RETRIES:
+                if retry_count > 0:
+                    logger.info(f"Session {session_id}: Retry {retry_count} for chunk {i+1}")
+                    # Add increasing delay between retries
+                    time.sleep(retry_count * 2)
+                
+                # Save chunk to temporary file
+                chunk_file = os.path.join(session_dir, f"chunk_{i}.txt")
+                with open(chunk_file, 'w') as f:
+                    f.write(chunk)
+                
+                # Output file for translation result
+                output_file = os.path.join(session_dir, f"result_{i}.txt")
+                
+                # Create command for separate process using the simplified translator
+                cmd = [
+                    "python3", script_path,
+                    chunk, source_language, target_language, 
+                    openai_api_key, output_file
+                ]
+                
+                # Run translation in separate process with timeout
+                logger.info(f"Session {session_id}: Starting subprocess for chunk {i+1}")
+                returncode, stdout, stderr = translation_processor.run_subprocess_safe(cmd, timeout=PROCESS_TIMEOUT)
+                
+                # Check if translation succeeded
+                if returncode == 0 and os.path.exists(output_file):
+                    try:
+                        with open(output_file, 'r') as f:
+                            result = f.read()
+                            
+                        if result.startswith("ERROR:"):
+                            logger.error(f"Session {session_id}: Chunk {i+1} failed: {result}")
+                            retry_count += 1
+                        else:
+                            results[i] = result
+                            logger.info(f"Session {session_id}: Chunk {i+1} completed successfully")
+                            success = True
+                    except Exception as e:
+                        logger.error(f"Session {session_id}: Error reading result file: {e}")
+                        retry_count += 1
                 else:
-                    results.append(result)
-                    logger.info(f"Chunk {i+1} completed successfully")
-            else:
-                logger.error(f"Chunk {i+1} failed with return code {returncode}")
-                logger.error(f"STDERR: {stderr}")
-                failed_chunks.append(i)
+                    logger.error(f"Session {session_id}: Chunk {i+1} failed with return code {returncode}")
+                    logger.error(f"Session {session_id}: STDERR: {stderr}")
+                    retry_count += 1
             
-            # Add a small delay to avoid rate limits
-            time.sleep(1)
+            # If all retries failed, mark this chunk as failed
+            if not success:
+                failed_chunks.append(i)
+                logger.error(f"Session {session_id}: All retries failed for chunk {i+1}")
+            
+            # Add a small delay to avoid rate limits but only if not the last chunk
+            if i < len(chunks) - 1:
+                time.sleep(0.5)
         
         # Clean up session directory
         try:
             shutil.rmtree(session_dir)
         except Exception as e:
-            logger.warning(f"Failed to clean up session directory: {e}")
+            logger.warning(f"Session {session_id}: Failed to clean up session directory: {e}")
         
         # Check if any chunks failed
         if failed_chunks:
-            logger.error(f"Failed to process chunks: {failed_chunks}")
+            logger.error(f"Session {session_id}: Failed to process chunks: {failed_chunks}")
             
             # Return partial results if we have any
-            if results:
-                partial_result = " ".join(results)
+            valid_results = [r for r in results if r is not None]
+            if valid_results:
+                partial_result = " ".join(valid_results)
                 return jsonify({
                     'success': False,
                     'error': f"Failed to process {len(failed_chunks)} out of {len(chunks)} chunks",
                     'partial_translation': partial_result,
                     'failed_chunks': failed_chunks,
-                    'progress': f"{len(results)}/{len(chunks)} chunks completed",
-                    'estimated_cost': f"${estimate_cost(total_tokens * (len(results)/len(chunks))):.4f}"
+                    'progress': f"{len(valid_results)}/{len(chunks)} chunks completed",
+                    'estimated_cost': f"${estimate_cost(total_tokens * (len(valid_results)/len(chunks))):.4f}"
                 }), 500
             else:
                 return jsonify({
@@ -435,7 +508,7 @@ def translate():
         final_translation = " ".join(results)
         total_time = time.time() - start_time
         
-        logger.info(f"Translation completed in {total_time:.2f} seconds")
+        logger.info(f"Session {session_id}: Translation completed in {total_time:.2f} seconds")
         
         # Return successful response
         return jsonify({
@@ -450,7 +523,7 @@ def translate():
         })
     
     except Exception as e:
-        logger.exception("Translation failed")
+        logger.exception(f"Session {session_id}: Translation failed")
         
         # Clean up session directory
         try:
@@ -464,6 +537,26 @@ def translate():
             'estimated_cost': f"${estimated_cost:.4f}" if 'estimated_cost' in locals() else None
         }), 500
 
+# Graceful shutdown
+def cleanup_on_exit(*args, **kwargs):
+    logger.info("Cleaning up before shutdown")
+    translation_processor.clean_up()
+    
+    # Clean up any remaining temp files
+    try:
+        for item in os.listdir(TEMP_DIR):
+            item_path = os.path.join(TEMP_DIR, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+    except Exception as e:
+        logger.warning(f"Error cleaning temp directory: {e}")
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, cleanup_on_exit)
+signal.signal(signal.SIGINT, cleanup_on_exit)
+
 # Run the Flask app
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
@@ -474,12 +567,13 @@ if __name__ == '__main__':
             item_path = os.path.join(TEMP_DIR, item)
             if os.path.isdir(item_path):
                 shutil.rmtree(item_path)
-            else:
+            elif os.path.isfile(item_path):
                 os.remove(item_path)
     except Exception as e:
         logger.warning(f"Error cleaning temp directory: {e}")
     
-    # Add environment variable for Gunicorn workers
+    # Set Gunicorn configuration via environment variables
     os.environ["WEB_CONCURRENCY"] = "1"  # Limit to single worker
+    os.environ["GUNICORN_CMD_ARGS"] = "--timeout 120 --graceful-timeout 30 --keep-alive 5 --max-requests 100 --max-requests-jitter 20"
     
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
