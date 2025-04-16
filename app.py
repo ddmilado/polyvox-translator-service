@@ -80,7 +80,7 @@ def upload_to_supabase(file_path, remote_filename):
     with open(file_path, "rb") as f:
         file_data = f.read()
     logger.info(f"Uploading {remote_filename} ({len(file_data)} bytes) to Supabase bucket {SUPABASE_BUCKET}...")
-    response = supabase.storage.from_(SUPABASE_BUCKET).upload(remote_filename, file_data, upsert=True)
+    response = supabase.storage.from_(SUPABASE_BUCKET).upload(remote_filename, file_data)
     logger.info(f"Upload response: {response}")
     return response
 
