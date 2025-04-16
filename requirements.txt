@@ -5,4 +5,4 @@ openai>=1.0.0
 tiktoken>=0.7.0
 gunicorn==21.2.0
 psutil==5.9.8
-supabase-py==0.0.7
+supabase==0.0.12
