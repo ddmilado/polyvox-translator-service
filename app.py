@@ -140,7 +140,7 @@ def clean_up_job(job_id):
 
 def translate_chunk_with_crewai(chunk_text, source_language, target_language, api_key):
     """
-    Use Crew AI to translate a text chunk.
+    Use Crew AI to translate a text chunk with improved agent definitions.
     """
     # Ensure the API key is set for the Crew AI components.
     os.environ["OPENAI_API_KEY"] = api_key
@@ -148,45 +148,44 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language, ap
         # Initialize the LLM with a timeout of 120 seconds.
         llm = LLM(model="gpt-3.5-turbo", timeout=120)
         
-        # Create a Translator agent.
+        # Define improved translation agents.
         translator = Agent(
-            role="Translator",
-            goal=f"Translate the given text from {source_language} to {target_language}.",
-            backstory="Expert translator",
-            verbose=False,
+            name='Translator',
+            goal='Translate documents with perfect accuracy while maintaining context and meaning',
+            backstory='You are an expert translator with deep knowledge of multiple languages and cultural nuances.',
+            verbose=True,
             allow_delegation=False,
             llm=llm
         )
         
-        # Create an Editor agent to refine the translation.
         editor = Agent(
-            role="Editor",
-            goal=f"Refine the translation to {target_language} ensuring clarity and style.",
-            backstory="Skilled language editor",
-            verbose=False,
+            name='Editor',
+            goal='Review and refine translations to ensure they are natural and idiomatic',
+            backstory='You are a professional editor with years of experience in refining translations.',
+            verbose=True,
             allow_delegation=False,
             llm=llm
         )
         
-        # Define the translation task.
+        # Define translation task.
         translate_task = Task(
-            description=f"Translate from {source_language} to {target_language}:\n\n{chunk_text}",
+            description=f"Translate the following text from {source_language} to {target_language}. Maintain the original formatting, tone, and meaning. The text to translate is: {chunk_text}",
             agent=translator,
-            expected_output="Translated text"
+            expected_output='The translated text with original formatting preserved'
         )
         
-        # Define the edit task.
+        # Define editing task.
         edit_task = Task(
-            description=f"Refine and polish the translation to {target_language}.",
+            description=f"Review and refine the translation to ensure it sounds natural in {target_language}. Fix any awkward phrasing, grammatical errors, or literal translations that don't capture the intended meaning.",
             agent=editor,
-            expected_output="Polished translation"
+            expected_output='The refined translation that reads naturally in the target language'
         )
         
         # Create and execute a Crew with both agents, running tasks sequentially.
         translation_crew = Crew(
             agents=[translator, editor],
             tasks=[translate_task, edit_task],
-            verbose=False,
+            verbose=True,
             process=Process.sequential
         )
         
@@ -354,6 +353,7 @@ def cancel_job(job_id):
             "error": "Job cancelled by user",
             "timestamp": datetime.utcnow().isoformat()
         }
+        # Create a simple PDF containing the cancellation message.
         save_translation_to_pdf(job_id, cancel_data.get("error"))
         return jsonify({"success": True, "job_id": job_id, "status": "cancelled"})
     
