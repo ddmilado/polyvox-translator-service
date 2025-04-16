@@ -14,7 +14,7 @@ import signal
 import sys
 
 # Import your Crew AI components (adjust the import paths as needed)
-from crew_ai import LLM, Agent, Task, Crew, Process
+from crewai import LLM, Agent, Task, Crew, Process
 
 # Initialize Flask app and enable CORS
 app = Flask(__name__)
