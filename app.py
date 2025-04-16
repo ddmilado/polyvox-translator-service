@@ -151,6 +151,7 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language, ap
         # Define improved translation agents.
         translator = Agent(
             name='Translator',
+            role='translator',
             goal='Translate documents with perfect accuracy while maintaining context and meaning',
             backstory='You are an expert translator with deep knowledge of multiple languages and cultural nuances.',
             verbose=True,
@@ -160,6 +161,7 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language, ap
         
         editor = Agent(
             name='Editor',
+            role='editor',
             goal='Review and refine translations to ensure they are natural and idiomatic',
             backstory='You are a professional editor with years of experience in refining translations.',
             verbose=True,
