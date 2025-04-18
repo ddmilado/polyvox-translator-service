@@ -178,9 +178,9 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language, ap
         
         # Define editing task.
         edit_task = Task(
-            description=f"Review and refine the translation to ensure it sounds natural in {target_language}. Fix any awkward phrasing, grammatical errors, or literal translations that don't capture the intended meaning.",
+            description=f"Review and refine the translation to ensure it sounds natural in {target_language}. Fix any awkward phrasing, grammatical errors, or literal translations that don't capture the intended meaning. Then properly format the result with correct heading and sub-heading, spacing paragraphs etc.",
             agent=editor,
-            expected_output='The refined translation that reads naturally in the target language'
+            expected_output='The refined translation that reads naturally in the target language and properly formatted'
         )
         
         # Create and execute a Crew with both agents, running tasks sequentially.
