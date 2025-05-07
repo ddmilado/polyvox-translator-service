@@ -24,8 +24,8 @@ from crewai import LLM, Agent, Task, Crew, Process
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY :
-    sys.exit("Please set SUPABASE_URL, and SUPABASE_KEY environment variables.")
+if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
+    sys.exit("Please set SUPABASE_URL, SUPABASE_KEY, and OPENAI_API_KEY environment variables.")
 
 # Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -138,12 +138,12 @@ def clean_up_job(job_id):
 
 # ========= CREW AI TRANSLATION FUNCTION =========
 
-def translate_chunk_with_crewai(chunk_text, source_language, target_language):
+def translate_chunk_with_crewai(chunk_text, source_language, target_language, api_key):
     """
     Use Crew AI to translate a text chunk with improved agent definitions.
     """
     # Ensure the API key is set for the Crew AI components.
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    os.environ["OPENAI_API_KEY"] = api_key
     try:
         # Initialize the LLM with a timeout of 120 seconds.
         llm = LLM(model="gpt-3.5-turbo", timeout=120)
@@ -203,7 +203,7 @@ def translate_chunk_with_crewai(chunk_text, source_language, target_language):
 
 # ========= JOB PROCESSING =========
 
-def process_translation_job(job_id, source_text, source_language, target_language):
+def process_translation_job(job_id, source_text, source_language, target_language, api_key):
     """
     Split the source text into chunks, translate each chunk using Crew AI,
     create a PDF with the full translation, and upload it to Supabase.
@@ -226,7 +226,7 @@ def process_translation_job(job_id, source_text, source_language, target_languag
         for idx, chunk in enumerate(chunks):
             logger.info(f"Job {job_id}: Translating chunk {idx+1}/{len(chunks)}...")
             try:
-                translated = translate_chunk_with_crewai(chunk, source_language, target_language)
+                translated = translate_chunk_with_crewai(chunk, source_language, target_language, api_key)
                 translated_chunks.append(translated)
                 update_job_data(job_id, {"chunks_completed": idx+1})
             except Exception as e:
@@ -273,17 +273,19 @@ def translate():
       "sourceText": "Text to translate...",
       "sourceLanguage": "Norwegian",
       "targetLanguage": "English",
+      "openaiApiKey": "your-openai-api-key"
     }
     """
     try:
         data = request.get_json()
-        required_fields = ["sourceText", "sourceLanguage", "targetLanguage"]
+        required_fields = ["sourceText", "sourceLanguage", "targetLanguage", "openaiApiKey"]
         if not all(data.get(field) for field in required_fields):
             return jsonify({"success": False, "error": "Missing required fields."}), 400
         
         source_text = data.get("sourceText")
         source_language = data.get("sourceLanguage")
         target_language = data.get("targetLanguage")
+        openai_api_key = data.get("openaiApiKey")
         
         job_id = str(uuid.uuid4())
         # Store initial job data.
@@ -300,7 +302,7 @@ def translate():
         # Start background processing.
         thread = threading.Thread(
             target=process_translation_job,
-            args=(job_id, source_text, source_language, target_language)
+            args=(job_id, source_text, source_language, target_language, openai_api_key)
         )
         thread.daemon = True
         thread.start()
